@@ -1,0 +1,107 @@
+name: CI & Deploy GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  validate:
+    name: Validate static site
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Validate site structure and local links
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f index.html || { echo "::error::index.html is missing from the repository root"; exit 1; }
+
+          python3 <<'PY'
+          from html.parser import HTMLParser
+          from pathlib import Path
+          from urllib.parse import unquote, urlparse
+          import sys
+
+          root = Path.cwd()
+          entry = root / "index.html"
+          source = entry.read_text(encoding="utf-8")
+
+          if "<!doctype html" not in source.lower():
+              print("::error::index.html must declare an HTML5 doctype")
+              sys.exit(1)
+
+          class LocalAssetChecker(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.errors = []
+
+              def handle_starttag(self, tag, attrs):
+                  attrs = dict(attrs)
+                  for attr in ("href", "src"):
+                      value = attrs.get(attr)
+                      if not value:
+                          continue
+                      parsed = urlparse(value)
+                      if parsed.scheme or parsed.netloc or value.startswith(("#", "//")):
+                          continue
+                      path = unquote(parsed.path)
+                      if not path:
+                          continue
+                      target = (root / path.lstrip("/")) if path.startswith("/") else (entry.parent / path)
+                      if target.is_dir():
+                          target = target / "index.html"
+                      if not target.exists():
+                          self.errors.append(f"{tag}[{attr}] references missing file: {value}")
+
+          checker = LocalAssetChecker()
+          checker.feed(source)
+          if checker.errors:
+              for error in checker.errors:
+                  print(f"::error::{error}")
+              sys.exit(1)
+
+          print("Static site structure and local HTML references are valid.")
+          PY
+
+      - name: Check whitespace errors
+        run: git diff --check
+
+  deploy:
+    name: Deploy to GitHub Pages
+    if: github.event_name != 'pull_request'
+    needs: validate
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
